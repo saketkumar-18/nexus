@@ -85,7 +85,8 @@ class LLMEngine:
                     args = json.loads(args) if args.strip() else {}
                 except json.JSONDecodeError:
                     args = {"_raw": args}
-            tool_calls.append(ToolCall(id=raw.get("id", ""), name=fn.get("name", ""), arguments=args or {}))
+            args = _normalize_tool_args(args) if isinstance(args, dict) else (args or {})
+            tool_calls.append(ToolCall(id=raw.get("id", ""), name=fn.get("name", ""), arguments=args))
         return ChatResponse(
             content=message.get("content") or "",
             tool_calls=tool_calls,
@@ -95,6 +96,15 @@ class LLMEngine:
 
     def close(self) -> None:
         self._client.close()
+
+
+def _normalize_tool_args(args: dict) -> dict:
+    """Unwrap spec-style arguments seen from small local models:
+    {"type": "function", "function": "name", "parameters": {real args}}."""
+    if (set(args) == {"type", "function", "parameters"}
+            and args.get("type") == "function" and isinstance(args.get("parameters"), dict)):
+        return args["parameters"]
+    return args
 
 
 def engine_from_env() -> LLMEngine:

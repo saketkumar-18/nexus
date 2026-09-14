@@ -10,15 +10,17 @@ import json
 from pathlib import Path
 from typing import Any
 
-from nexus.engine import ChatResponse, LLMEngine, NexusError
+from nexus.engine import ChatResponse, LLMEngine, NexusError, ToolCall
 from nexus.memory import Memory
 from nexus.tools.registry import ToolRegistry
 
 SYSTEM_PROMPT = """You are NEXUS, an autonomous computer agent.
 Given an objective, accomplish it using the tools available. Rules:
-- Prefer tools over guessing. Verify facts by reading files or fetching pages.
+- Use tools; never claim work is done without a successful tool result proving it.
+- fs tools take paths RELATIVE to the workspace root, e.g. "notes.txt". Never use absolute paths.
+- When the objective names a specific filename, use EXACTLY that filename — do not invent others.
+- After writing a file, read it back to verify.
 - When the objective is complete, reply with your final report as plain text (no tool calls).
-- Keep workspace paths relative to the workspace root.
 Be concise in the final report."""
 
 
@@ -64,12 +66,44 @@ class Agent:
                                   {"step": step, "content": resp.content[:500],
                                    "tool_calls": [(t.name, t.arguments) for t in resp.tool_calls]})
             if not resp.tool_calls:
+                # fallback: some models emit tool calls as plain content JSON
+                fb = self._content_tool_calls(resp.content)
+                if fb:
+                    # re-declare natively so tool-result messages stay well-formed
+                    self.messages[-1] = _fb_message(resp.content, fb)
+                    for call in fb:
+                        self._execute_tool(ep_id, call)
+                    continue
                 return resp.content  # final answer
             for call in resp.tool_calls:
                 self._execute_tool(ep_id, call)
         raise NexusError(f"max steps ({self.max_steps}) reached without a final answer")
 
+    def _content_tool_calls(self, content: str) -> list[ToolCall]:
+        """Parse tool calls the model wrote as JSON in plain content."""
+        calls: list[ToolCall] = []
+        for obj in _json_objects(content or ""):
+            if not isinstance(obj, dict):
+                continue
+            name, params = None, {}
+            if isinstance(obj.get("name"), str):
+                name = obj["name"]
+                params = obj.get("parameters") or obj.get("param") or obj.get("arguments") or obj.get("args") or {}
+            elif obj.get("type") == "function" and isinstance(obj.get("function"), dict):
+                inner = obj["function"]
+                if isinstance(inner.get("name"), str):
+                    name = inner["name"]
+                params = inner.get("parameters") or inner.get("param") or {}
+            elif isinstance(obj.get("function"), str) and isinstance(obj.get("parameters"), dict):
+                name = obj["function"]
+                params = obj["parameters"]
+            if name and name in self.registry and isinstance(params, dict):
+                calls.append(ToolCall(id=f"content-{len(calls)}", name=name,
+                                     arguments=dict(params)))
+        return calls
+
     def _execute_tool(self, ep_id: int, call) -> None:
+        call.arguments = _normalize_args(call.arguments)
         try:
             result = self.registry.call(call.name, **call.arguments)
             content = json.dumps(result, ensure_ascii=False, default=str)[:8000]
@@ -122,3 +156,69 @@ def _extract_json(text: str) -> str:
             if part.startswith("{") and part.endswith("}"):
                 return part
     return text.strip()
+
+
+def _fb_message(content: str, calls: list[ToolCall]) -> dict[str, Any]:
+    """Assistant message carrying content-parsed calls in native tool_calls form."""
+    return {
+        "role": "assistant", "content": content,
+        "tool_calls": [
+            {"id": c.id, "type": "function",
+             "function": {"name": c.name, "arguments": json.dumps(c.arguments)}}
+            for c in calls
+        ],
+    }
+
+
+def _normalize_args(args: Any) -> dict:
+    """Normalize spec-style tool arguments ('parameters'/'param' wrapping)."""
+    if not isinstance(args, dict):
+        return {}
+    spec_keys = ("parameters", "param", "arguments", "args")
+    if (isinstance(args.get("type"), str) and args["type"] == "function"
+            and isinstance(args.get("function"), (str, dict))
+            and any(k in args for k in spec_keys)):
+        for k in spec_keys:
+            if isinstance(args.get(k), dict):
+                return args[k]
+    if isinstance(args.get("function"), str):
+        for k in spec_keys:
+            if isinstance(args.get(k), dict):
+                return args[k]
+    return args
+
+
+def _json_objects(text: str) -> list[Any]:
+    """Extract top-level JSON objects from text via balanced-brace scanning.
+
+    Tolerant of trailing garbage after the closing brace (small-model habit),
+    fences, and multiple consecutive objects.
+    """
+    out: list[Any] = []
+    depth, start = 0, None
+    in_str, esc = False, False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    try:
+                        out.append(json.loads(text[start:i + 1]))
+                    except json.JSONDecodeError:
+                        pass
+                    start = None
+    return out

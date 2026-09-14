@@ -35,8 +35,15 @@ def _resolve(workspace: Path, path: str) -> Path:
         p = workspace / p
     p = p.resolve()
     if not p.is_relative_to(workspace.resolve()):
-        raise NexusError(f"path outside workspace: {path}")
+        raise NexusError(
+            f"path outside workspace: {path!r}. All fs tools take paths RELATIVE to "
+            f"the workspace root ({workspace}). e.g. 'notes.txt' or 'sub/dir/file.txt'.")
     return p
+
+
+def _rel(workspace: Path, p: Path) -> str:
+    """Workspace-relative POSIX path for tool results (model round-trip safety)."""
+    return p.resolve().relative_to(workspace.resolve()).as_posix()
 
 
 def _sh(command: str, cwd: Path) -> dict[str, Any]:
@@ -105,14 +112,15 @@ def _fs_read(workspace: Path, path: str) -> dict:
     p = _resolve(workspace, path)
     if not p.is_file():
         raise NexusError(f"not found: {path}")
-    return {"path": str(p), "content": p.read_text(encoding="utf-8", errors="replace")[:20000]}
+    return {"path": _rel(workspace, p),
+            "content": p.read_text(encoding="utf-8", errors="replace")[:20000]}
 
 
 def _fs_write(workspace: Path, path: str, text: str) -> dict:
     p = _resolve(workspace, path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(text, encoding="utf-8")
-    return {"path": str(p), "bytes": len(text.encode("utf-8"))}
+    return {"path": _rel(workspace, p), "bytes": len(text.encode("utf-8"))}
 
 
 def _fs_list(workspace: Path, path: str = ".") -> dict:
@@ -126,7 +134,7 @@ def _fs_list(workspace: Path, path: str = ".") -> dict:
             "type": "dir" if child.is_dir() else "file",
             "bytes": child.stat().st_size if child.is_file() else None,
         })
-    return {"path": str(p), "entries": entries}
+    return {"path": _rel(workspace, p) if p != workspace else ".", "entries": entries}
 
 
 def _web_fetch(http: httpx.Client, url: str) -> dict:
