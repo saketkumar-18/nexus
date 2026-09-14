@@ -28,8 +28,17 @@ _BLOCKED = [
 ]
 
 
+_WIN_ABS = __import__("re").compile(r"^[A-Za-z]:[\\/]").match
+
+
 def _resolve(workspace: Path, path: str) -> Path:
     """Resolve `path` inside workspace; refuse escape (test FIRST impl)."""
+    # Windows-style absolute/UNC paths must be refused on EVERY OS — on Linux
+    # pathlib treats "C:/x" as relative and silently joins it into the workspace.
+    if _WIN_ABS(path) or path.startswith("\\\\") or path.startswith("//"):
+        raise NexusError(
+            f"path outside workspace: {path!r}. All fs tools take paths RELATIVE to "
+            f"the workspace root ({workspace}). e.g. 'notes.txt' or 'sub/dir/file.txt'.")
     p = Path(path)
     if not p.is_absolute():
         p = workspace / p
